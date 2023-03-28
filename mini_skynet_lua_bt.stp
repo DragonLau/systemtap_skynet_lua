@@ -1,0 +1,141 @@
+probe begin {
+    warn(sprintf("Tracing %d (%s)  %d(serviceid) for standard Lua 5.4.4 ...\n", target(),@1,strtol(@2, 10)))
+}
+
+global quit = 0;
+global stack_trace;
+
+probe process(@1).function("luaL_*"),
+    process(@1).function("lua_*")
+{
+    if (@defined($L) && !quit) {
+        L = $L
+        p = L->ci
+        stack = ""
+
+        idx = 1
+        if ( idx != 1 || (p->func->val->tt_) == (6 | (1 << 4)) ) {
+            // LUA_VLCF, ignore light c function
+            next
+        }
+        else {
+            gc = p->func->val->value_->gc
+            closure = &@cast(gc, "GCUnion", @1)->cl
+            func = &@cast(closure, "Closure", @1)->c //CClosure
+            if (idx <= func->nupvalues) {
+                upvalue_type = func->upvalue[idx - 1]->tt_
+                if (upvalue_type != 2) { // light userdata
+                    next
+                } /* only this one can enter counter */
+                skynet_context = &@cast(func->upvalue[idx - 1]->value_->p, "skynet_context", @1)
+                /* service id in decimal*/
+                if (skynet_context->handle != strtol(@2, 10)) {
+                    //next
+                }
+            } else {
+                next
+            }
+        }
+
+        while (p != 0 && !quit) {
+            tt = p->func->val->tt_ & 0x3f
+            if ( tt == 0x06 ) {
+                gc = p->func->val->value_->gc
+                closure = &@cast(gc, "GCUnion", @1)->cl
+                lua_closure = &closure->l
+                proto = lua_closure->p
+                source = proto->source
+                lineinfo = proto->lineinfo
+                line_index = p->u->l->savedpc - proto->code
+
+                filename = kernel_string(source + 32)
+                ci = p
+                f = proto
+
+                basepc = 0
+                baseline = 0
+                MAXIWTHABS = 128
+                ABSLINEINFO = -0x80
+                pc = line_index / 4 - 1
+                if(lineinfo == 0){
+                    lineno = -1
+                }
+                else{
+                    sizeabslineinfo = @cast(f, "Proto", @1)->sizeabslineinfo
+                    if( sizeabslineinfo == 0 ){
+                        basepc = -1
+                        baseline = @cast(f, "Proto", @1)->linedefined
+                    }
+                    else{
+                        abslineinfo =  @cast(f, "Proto", @1)->abslineinfo
+                        abslineinfo_0 = &@cast(abslineinfo, "AbsLineInfo", @1)[0]
+
+                        if( pc < abslineinfo_0->pc ){
+                            basepc = -1
+                            baseline =  @cast(f, "Proto", @1)->linedefined
+                        }
+                        else{
+                            pcc = @cast(pc, "unsigned int")
+                            i = pcc / MAXIWTHABS - 1
+                            while( i + 1 <  @cast(f, "Proto", @1)->sizeabslineinfo){
+                                abslineinfo_1 = &@cast(abslineinfo, "AbsLineInfo", @1)[1]
+                                if( pc < abslineinfo_1->pc){
+                                    break
+                                }
+                                i = i + 1
+                            }
+                            abslineinfo_i = &@cast(abslineinfo, "AbsLineInfo", @1)[i]
+                            basepc = abslineinfo_i->pc
+                            baseline = abslineinfo_i->line
+                        }
+                    }
+                    while( basepc++ < pc){
+                        lineinfo =  @cast(f, "Proto", @1)->lineinfo
+                        tmp = @cast(lineinfo, "ls_byte", @1)[basepc]
+                        baseline = baseline + tmp
+                    }
+                    lineno = baseline
+                }
+                frame = sprintf("%s:%d", filename, lineno)
+            }
+            else if ( tt == 0x16 ) {
+                f = p->func->val->value_->f
+                frame = "light_c_function:" . usymname(f)
+            }
+            else if ( tt == 0x26 ) {
+                gc = p->func->val->value_->gc
+                f = &@cast(gc, "GCUnion", @1)->cl->c->f
+                frame = "c_function:" . usymname(f)
+            }
+            else
+                frame = "nil"
+
+            p = p->previous
+            if (frame != "nil") {
+                if (stack == "") {
+                    stack = frame
+                }
+                else {
+                    stack = frame . ";" . stack
+                }
+            }
+        }
+        if (stack != "") {
+            stack_trace[stack]++
+        }
+    }
+    else {
+        //printf("def pass %d\n",@defined($L))
+    }
+}
+
+probe timer.s(10) {
+    warn("Quiting now\\n")
+    quit = 1;
+    exit()
+}
+
+probe end{
+    foreach (stack+ in stack_trace)
+        printf("%s %8d\n", stack, stack_trace[stack])
+}
